@@ -1,3 +1,6 @@
+import numpy as np
+import random
+
 class EpsilonGreedy:
     def __init__(self, epsilon: float, n_features: int, learning_rate: float = 0.1):
         self.epsilon = epsilon
