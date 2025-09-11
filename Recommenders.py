@@ -1,3 +1,7 @@
+import numpy as np
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+
 def simular_recomendacao_top5_epsilon_greedy(df_merged, catalogo_df, model, top_k=5, warmup=30):
     historico = []
 
