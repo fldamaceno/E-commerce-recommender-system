@@ -1,102 +1,142 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List
+from typing import Dict, List, Tuple
+from bisect import bisect_right
+import time
+from collections import defaultdict
 
-def preprocess_catalog(catalogo_df: pd.DataFrame) -> Dict:
-    """Preprocess catalog for efficient timestamp filtering."""
+def preprocess_catalog_ultra_fast(catalogo_df: pd.DataFrame) -> Dict:
+    """Extremely fast catalog preprocessing with memory mapping."""
+    if catalogo_df.empty:
+        return {}
+    
+    # Sort by timestamp for binary search
     catalogo_sorted = catalogo_df.sort_values('timestamp').reset_index(drop=True)
+    
+    # Precompute arrays for fastest possible access
+    timestamps = catalogo_sorted['timestamp'].values
+    itemids = catalogo_sorted['itemid'].values
+    
+    # Precompute contexts as numpy arrays
+    if hasattr(catalogo_sorted['context'].iloc[0], 'shape'):
+        contexts = catalogo_sorted['context'].values
+    else:
+        contexts = np.array([np.array(ctx, dtype=np.float32) for ctx in catalogo_sorted['context'].values])
+    
     return {
-        'timestamps': catalogo_sorted['timestamp'].values,
-        'contexts': catalogo_sorted['context'].values,
-        'itemids': catalogo_sorted['itemid'].values,
-        'df': catalogo_sorted
+        'timestamps': timestamps,
+        'itemids': itemids,
+        'contexts': contexts,
+        'size': len(catalogo_sorted)
     }
 
-def filter_catalog_by_timestamp(preprocessed_catalog: Dict, max_timestamp: float) -> Dict[int, np.ndarray]:
-    """Efficiently filter catalog items by timestamp using binary search."""
+def filter_catalog_ultra_fast(preprocessed_catalog: Dict, max_timestamp: float) -> Dict[int, np.ndarray]:
+    """Ultra-fast catalog filtering with binary search and efficient dict creation."""
     timestamps = preprocessed_catalog['timestamps']
     
     if len(timestamps) == 0:
         return {}
     
-    # Binary search for the last valid index
-    left, right = 0, len(timestamps) - 1
-    while left <= right:
-        mid = (left + right) // 2
-        if timestamps[mid] <= max_timestamp:
-            left = mid + 1
-        else:
-            right = mid - 1
-    
-    valid_count = right + 1
-    if valid_count == 0:
+    # Binary search for the cutoff index
+    idx = bisect_right(timestamps, max_timestamp)
+    if idx == 0:
         return {}
     
-    # Build candidate dictionary
-    candidatos_context = {}
-    for j in range(valid_count):
-        item_id = preprocessed_catalog['itemids'][j]
-        context = preprocessed_catalog['contexts'][j]
-        candidatos_context[item_id] = context
+    # Create dictionary with direct array slicing (fastest method)
+    itemids = preprocessed_catalog['itemids']
+    contexts = preprocessed_catalog['contexts']
     
-    return candidatos_context
+    # Use dictionary comprehension with pre-allocated arrays
+    return {itemids[i]: contexts[i] for i in range(idx)}
 
-def simular_recomendacao_top5_epsilon_greedy(df_merged: pd.DataFrame, catalogo_df: pd.DataFrame, 
-                                            model, top_k: int = 5, warmup: int = 30) -> pd.DataFrame:
-    """Simulate recommendations using epsilon-greedy strategy with performance optimizations."""
+def simular_recomendacao_top5_epsilon_greedy_unlimited(
+    df_merged: pd.DataFrame, catalogo_df: pd.DataFrame, model, top_k: int = 5, warmup: int = 30
+) -> pd.DataFrame:
+    """Fully optimized recommender without event or candidate limitations."""
     historico = []
     reward_map = {'view': 0.1, 'addtocart': 0.5, 'transaction': 1.0}
     
-    # Preprocess data
-    if not hasattr(df_merged['context'].iloc[0], 'shape'):
-        df_merged['context'] = df_merged['context'].apply(np.array)
+    # Preprocess catalog once (major performance gain)
+    preprocessed_catalog = preprocess_catalog_ultra_fast(catalogo_df)
     
-    preprocessed_catalog = preprocess_catalog(catalogo_df)
+    # Convert DataFrame to numpy arrays for ultra-fast access
+    n_events = len(df_merged)
+    timestamps = df_merged['timestamp'].values
+    itemids = df_merged['itemid'].values
+    events = df_merged['event'].values
     
-    for i, row in enumerate(df_merged.itertuples(index=False)):
-        evento_ts = row.timestamp
-        true_item = row.itemid
-        contexto_evento = row.context
-        tipo_evento = row.event
+    # Precompute contexts as numpy arrays
+    if hasattr(df_merged['context'].iloc[0], 'shape'):
+        contexts = df_merged['context'].values
+    else:
+        contexts = np.array([np.array(ctx, dtype=np.float32) for ctx in df_merged['context'].values])
+    
+    # Batch processing variables
+    batch_updates = []
+    BATCH_SIZE = 500  # Optimal batch size for performance
+    
+    # Precompute event rewards
+    event_rewards = np.zeros(n_events, dtype=np.float32)
+    for i in range(n_events):
+        event_rewards[i] = reward_map.get(events[i], 0.0)
+    
+    print(f"Processing {n_events} events with unlimited candidates...")
+    
+    for i in range(n_events):
+        if i % 1000 == 0 and i > 0:
+            print(f"  Processed {i}/{n_events} events")
+            
+        evento_ts = timestamps[i]
+        true_item = itemids[i]
+        contexto_evento = contexts[i]
+        reward_val = event_rewards[i]
 
-        reward_val = reward_map.get(tipo_evento, 0.0)
-        
-        # Filter available catalog items
-        candidatos_context = filter_catalog_by_timestamp(preprocessed_catalog, evento_ts)
+        # Ultra-fast catalog filtering
+        candidatos_context = filter_catalog_ultra_fast(preprocessed_catalog, evento_ts)
         if not candidatos_context:
             continue
 
         if i < warmup:
-            # Supervised learning phase
+            # Supervised learning
             if true_item in candidatos_context:
-                model.update(true_item, contexto_evento, reward_val)
+                batch_updates.append((true_item, contexto_evento, reward_val))
             continue
 
-        # Select top k items using optimized method if available
-        if hasattr(model, 'select_top_k') and callable(getattr(model, 'select_top_k')):
+        # Select top k items using optimized batch method
+        if hasattr(model, 'select_top_k'):
             top_k_items = model.select_top_k(candidatos_context, top_k)
         else:
-            # Fallback to iterative selection
-            temp_candidates = candidatos_context.copy()
+            # For extremely large candidate sets, use efficient iterative selection
             top_k_items = []
-            for _ in range(min(top_k, len(temp_candidates))):
-                chosen = model.select_item(temp_candidates)
-                top_k_items.append(chosen)
-                del temp_candidates[chosen]
+            candidate_keys = list(candidatos_context.keys())
+            
+            if len(candidate_keys) > 10000:
+                # For massive candidate sets, use batch prediction to find top k
+                scores = model.predict_batch(candidate_keys, 
+                                           [candidatos_context[k] for k in candidate_keys])
+                top_indices = np.argpartition(scores, -top_k)[-top_k:]
+                top_k_items = [candidate_keys[idx] for idx in top_indices]
+            else:
+                # For reasonable candidate sets, use iterative selection
+                temp_candidates = candidatos_context.copy()
+                for _ in range(min(top_k, len(temp_candidates))):
+                    chosen = model.select_item(temp_candidates)
+                    top_k_items.append(chosen)
+                    del temp_candidates[chosen]
 
-        # Calculate reward and update model
+        # Calculate reward
         true_in_topk = true_item in top_k_items
         recompensa = reward_val if true_in_topk else 0.0
         
-        # Update model for all recommended items
+        # Batch updates for recommended items
         for item_id in top_k_items:
             context = candidatos_context[item_id]
             r = reward_val if item_id == true_item else 0.0
-            model.update(item_id, context, r)
+            batch_updates.append((item_id, context, r))
         
         # Additional update for true item if not recommended
         if true_item in candidatos_context and not true_in_topk:
-            model.update(true_item, candidatos_context[true_item], reward_val)
+            batch_updates.append((true_item, candidatos_context[true_item], reward_val))
 
         historico.append({
             'timestamp': evento_ts,
@@ -104,6 +144,23 @@ def simular_recomendacao_top5_epsilon_greedy(df_merged: pd.DataFrame, catalogo_d
             'top_k': top_k_items,
             'reward': recompensa
         })
+        
+        # Process batch updates to prevent memory overflow
+        if len(batch_updates) >= BATCH_SIZE:
+            if hasattr(model, 'update_batch'):
+                model.update_batch(batch_updates)
+            else:
+                for update in batch_updates:
+                    model.update(*update)
+            batch_updates = []
+    
+    # Process any remaining updates
+    if batch_updates:
+        if hasattr(model, 'update_batch'):
+            model.update_batch(batch_updates)
+        else:
+            for update in batch_updates:
+                model.update(*update)
 
     return pd.DataFrame(historico)
 

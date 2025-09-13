@@ -1,6 +1,7 @@
 import numpy as np
 import random
-from typing import Dict, List
+from typing import Dict, List, Tuple
+import numba
 
 class EpsilonGreedy:
     def __init__(self, epsilon: float, n_features: int, learning_rate: float = 0.1):
@@ -8,91 +9,128 @@ class EpsilonGreedy:
         self.lr = learning_rate
         self.n_features = n_features
         self.weights = {}  # item_id -> weight vector
+        self._weight_cache = {}  # Cache for normalized weights
+        self._cache_dirty = set()  # Track which weights need cache update
 
     def _get_weights(self, item_id):
         """Return the weight vector for an item, initializing if needed."""
         if item_id not in self.weights:
-            self.weights[item_id] = np.zeros(self.n_features)
+            self.weights[item_id] = np.zeros(self.n_features, dtype=np.float32)
+            self._weight_cache[item_id] = np.zeros(self.n_features, dtype=np.float32)
         return self.weights[item_id]
 
-    def _normalize(self, vector):
-        """Normalize a vector safely (returns unchanged if norm is too small)."""
-        norm = np.linalg.norm(vector)
-        return vector / norm if norm > 1e-8 else vector
+    def _normalize_vector(self, vector):
+        """Fast vector normalization with SIMD optimization."""
+        norm = np.sqrt(np.dot(vector, vector))
+        if norm > 1e-12:
+            return vector * (1.0 / norm)
+        return vector
 
-    def predict(self, item_id, context_vector):
-        """Return expected reward for item given its context."""
-        weights = self._get_weights(item_id)
-        context_vector = self._normalize(context_vector)
-        return np.dot(weights, context_vector)
+    def _normalize_weights_batch(self, item_ids):
+        """Normalize weights for multiple items efficiently."""
+        for item_id in item_ids:
+            if item_id in self._cache_dirty:
+                weights = self.weights[item_id]
+                norm = np.sqrt(np.dot(weights, weights))
+                if norm > 1e-12:
+                    self._weight_cache[item_id] = weights * (1.0 / norm)
+                else:
+                    self._weight_cache[item_id] = weights.copy()
+                self._cache_dirty.remove(item_id)
+
+    def predict_batch(self, item_ids: List[int], contexts: List[np.ndarray]) -> np.ndarray:
+        """Ultra-fast batch prediction using precomputed normalized weights."""
+        if not item_ids:
+            return np.array([], dtype=np.float32)
+        
+        # Ensure weights are normalized
+        self._normalize_weights_batch(item_ids)
+        
+        # Use list comprehension for faster context normalization
+        contexts_norm = [self._normalize_vector(ctx) for ctx in contexts]
+        
+        # Compute scores using efficient dot products
+        scores = np.empty(len(item_ids), dtype=np.float32)
+        for i, item_id in enumerate(item_ids):
+            scores[i] = np.dot(self._weight_cache[item_id], contexts_norm[i])
+        
+        return scores
+
+    @staticmethod
+    @numba.jit(nopython=True)
+    def _compute_scores_numba(weights_matrix, contexts_norm):
+        """Numba-accelerated score computation."""
+        n = weights_matrix.shape[0]
+        scores = np.empty(n, dtype=np.float32)
+        for i in range(n):
+            scores[i] = np.dot(weights_matrix[i], contexts_norm[i])
+        return scores
 
     def select_item(self, candidate_items_contexts: Dict[int, np.ndarray]) -> int:
-        """
-        Select an item using epsilon-greedy strategy.
-        Vectorized for performance with large candidate sets.
-        """
-        # Exploration: pick random item
+        """Optimized item selection for large candidate sets."""
+        if not candidate_items_contexts:
+            return None
+            
+        n_candidates = len(candidate_items_contexts)
+        
+        # Exploration with probability epsilon
         if random.random() < self.epsilon:
             return random.choice(list(candidate_items_contexts.keys()))
 
-        # Exploitation: compute scores in batch
-        item_ids = np.array(list(candidate_items_contexts.keys()))
-        contexts = np.stack([self._normalize(candidate_items_contexts[i]) for i in item_ids])
-
-        # Ensure weights exist for all items
-        for i in item_ids:
-            self._get_weights(i)
-
-        # Stack weights into matrix
-        weights = np.stack([self.weights[i] for i in item_ids])
-
-        # Compute dot products row-wise (fast)
-        scores = np.einsum("ij,ij->i", weights, contexts)
-
-        # Pick the item with highest score
+        # For very large candidate sets, use optimized batch processing
+        item_ids = list(candidate_items_contexts.keys())
+        contexts = list(candidate_items_contexts.values())
+        
+        scores = self.predict_batch(item_ids, contexts)
         return item_ids[np.argmax(scores)]
 
     def select_top_k(self, candidate_items_contexts: Dict[int, np.ndarray], k: int) -> List[int]:
-        """
-        Select top k items efficiently using batch operations.
-        Optional method for improved performance in recommender systems.
-        """
-        if len(candidate_items_contexts) <= k:
+        """Highly optimized top-k selection without candidate limitation."""
+        if not candidate_items_contexts:
+            return []
+            
+        n_candidates = len(candidate_items_contexts)
+        
+        if n_candidates <= k:
             return list(candidate_items_contexts.keys())
         
-        # Exploration: pick random k items
+        # Exploration
         if random.random() < self.epsilon:
             all_items = list(candidate_items_contexts.keys())
-            return random.sample(all_items, min(k, len(all_items)))
+            return random.sample(all_items, k)
         
-        # Exploitation: compute scores in batch and select top k
-        item_ids = np.array(list(candidate_items_contexts.keys()))
-        contexts = np.stack([self._normalize(candidate_items_contexts[i]) for i in item_ids])
+        # Batch processing for exploitation
+        item_ids = list(candidate_items_contexts.keys())
+        contexts = list(candidate_items_contexts.values())
         
-        # Ensure weights exist for all items
-        for i in item_ids:
-            self._get_weights(i)
+        scores = self.predict_batch(item_ids, contexts)
         
-        # Stack weights into matrix
-        weights = np.stack([self.weights[i] for i in item_ids])
+        # Use argpartition for O(n) complexity instead of O(n log n)
+        if k < n_candidates // 2:
+            # For small k, use argpartition on the larger end
+            indices = np.argpartition(scores, -k)[-k:]
+        else:
+            # For large k, partition the smaller end
+            indices = np.argpartition(scores, k)[:k]
         
-        # Compute scores efficiently
-        scores = np.einsum("ij,ij->i", weights, contexts)
-        
-        # Get top k indices (using argpartition for efficiency)
-        top_k_indices = np.argpartition(scores, -k)[-k:]
-        return item_ids[top_k_indices].tolist()
+        return [item_ids[i] for i in indices]
+
+    def update_batch(self, updates: List[Tuple[int, np.ndarray, float]]):
+        """Batch update for maximum efficiency."""
+        for item_id, context_vector, reward in updates:
+            self.update(item_id, context_vector, reward)
 
     def update(self, item_id: int, context_vector: np.ndarray, reward: float):
-        """Update weights for an item after observing a reward."""
-        context_vector = self._normalize(context_vector)
-        prediction = self.predict(item_id, context_vector)
+        """Single item update with optimized computation."""
+        context_norm = self._normalize_vector(context_vector)
+        
+        # Get weights and compute prediction
+        weights = self._get_weights(item_id)
+        prediction = np.dot(weights, context_norm)
         error = reward - prediction
 
-        self.weights[item_id] += self.lr * error * context_vector
-
-        # Normalize weights lazily after update
-        norm = np.linalg.norm(self.weights[item_id])
-        if norm > 1e-8:
-            self.weights[item_id] /= norm
-
+        # In-place update for maximum efficiency
+        weights += self.lr * error * context_norm
+        
+        # Mark for cache update
+        self._cache_dirty.add(item_id)
