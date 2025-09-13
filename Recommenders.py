@@ -1,57 +1,101 @@
 import numpy as np
 import pandas as pd
-from sklearn.metrics.pairwise import cosine_similarity
+from typing import Dict, List
 
-def simular_recomendacao_top5_epsilon_greedy(df_merged, catalogo_df, model, top_k=5, warmup=30):
+def preprocess_catalog(catalogo_df: pd.DataFrame) -> Dict:
+    """Preprocess catalog for efficient timestamp filtering."""
+    catalogo_sorted = catalogo_df.sort_values('timestamp').reset_index(drop=True)
+    return {
+        'timestamps': catalogo_sorted['timestamp'].values,
+        'contexts': catalogo_sorted['context'].values,
+        'itemids': catalogo_sorted['itemid'].values,
+        'df': catalogo_sorted
+    }
+
+def filter_catalog_by_timestamp(preprocessed_catalog: Dict, max_timestamp: float) -> Dict[int, np.ndarray]:
+    """Efficiently filter catalog items by timestamp using binary search."""
+    timestamps = preprocessed_catalog['timestamps']
+    
+    if len(timestamps) == 0:
+        return {}
+    
+    # Binary search for the last valid index
+    left, right = 0, len(timestamps) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if timestamps[mid] <= max_timestamp:
+            left = mid + 1
+        else:
+            right = mid - 1
+    
+    valid_count = right + 1
+    if valid_count == 0:
+        return {}
+    
+    # Build candidate dictionary
+    candidatos_context = {}
+    for j in range(valid_count):
+        item_id = preprocessed_catalog['itemids'][j]
+        context = preprocessed_catalog['contexts'][j]
+        candidatos_context[item_id] = context
+    
+    return candidatos_context
+
+def simular_recomendacao_top5_epsilon_greedy(df_merged: pd.DataFrame, catalogo_df: pd.DataFrame, 
+                                            model, top_k: int = 5, warmup: int = 30) -> pd.DataFrame:
+    """Simulate recommendations using epsilon-greedy strategy with performance optimizations."""
     historico = []
-
-    # Converte contextos para np.array
-    df_merged['context'] = df_merged['context'].apply(lambda x: np.array(x))
-    catalogo_df['context'] = catalogo_df['context'].apply(lambda x: np.array(x))
-
+    reward_map = {'view': 0.1, 'addtocart': 0.5, 'transaction': 1.0}
+    
+    # Preprocess data
+    if not hasattr(df_merged['context'].iloc[0], 'shape'):
+        df_merged['context'] = df_merged['context'].apply(np.array)
+    
+    preprocessed_catalog = preprocess_catalog(catalogo_df)
+    
     for i, row in enumerate(df_merged.itertuples(index=False)):
         evento_ts = row.timestamp
         true_item = row.itemid
         contexto_evento = row.context
         tipo_evento = row.event
 
-        reward_val = {'view': 0.1, 'addtocart': 0.5, 'transaction': 1.0}.get(tipo_evento, 0.0)
-
-        # Filtra catálogo disponível até o timestamp do evento
-        disponiveis = catalogo_df[catalogo_df['timestamp'] <= evento_ts]
-        if disponiveis.empty:
+        reward_val = reward_map.get(tipo_evento, 0.0)
+        
+        # Filter available catalog items
+        candidatos_context = filter_catalog_by_timestamp(preprocessed_catalog, evento_ts)
+        if not candidatos_context:
             continue
 
-        # Mapeia itemid -> contexto
-        candidatos_context = {
-            r['itemid']: np.array(r['context']) for _, r in disponiveis.iterrows()
-        }
-
         if i < warmup:
-            # Fase de aprendizado supervisionado
+            # Supervised learning phase
             if true_item in candidatos_context:
                 model.update(true_item, contexto_evento, reward_val)
-            continue  # Não recomenda nessa fase
+            continue
 
-        # Copia dos candidatos para iteração segura
-        candidatos_restantes = candidatos_context.copy()
-        top_k_items = []
+        # Select top k items using optimized method if available
+        if hasattr(model, 'select_top_k') and callable(getattr(model, 'select_top_k')):
+            top_k_items = model.select_top_k(candidatos_context, top_k)
+        else:
+            # Fallback to iterative selection
+            temp_candidates = candidatos_context.copy()
+            top_k_items = []
+            for _ in range(min(top_k, len(temp_candidates))):
+                chosen = model.select_item(temp_candidates)
+                top_k_items.append(chosen)
+                del temp_candidates[chosen]
 
-        # Seleção de itens com exploração e exploração
-        for _ in range(min(top_k, len(candidatos_restantes))):
-            # Usa a função select_item diretamente
-            item_escolhido = model.select_item(candidatos_restantes)
-            top_k_items.append(item_escolhido)
-            candidatos_restantes.pop(item_escolhido)
-
-        # Avalia recompensa total: se true_item está entre os top_k
-        recompensa = reward_val if true_item in top_k_items else 0.0
-        # Atualiza modelo com todos os top_k itens
+        # Calculate reward and update model
+        true_in_topk = true_item in top_k_items
+        recompensa = reward_val if true_in_topk else 0.0
+        
+        # Update model for all recommended items
         for item_id in top_k_items:
+            context = candidatos_context[item_id]
             r = reward_val if item_id == true_item else 0.0
-            model.update(item_id, candidatos_context[item_id], r)
-        # Aprendizado supervisionado adicional com true_item (se disponível)
-        if true_item in candidatos_context:
+            model.update(item_id, context, r)
+        
+        # Additional update for true item if not recommended
+        if true_item in candidatos_context and not true_in_topk:
             model.update(true_item, candidatos_context[true_item], reward_val)
 
         historico.append({
