@@ -1,5 +1,6 @@
 import numpy as np
 import random
+import torch
 
 # ----------------------------
 # Modelo EpsilonGreedy em PyTorch (vetorizado)
