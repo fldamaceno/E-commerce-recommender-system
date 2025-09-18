@@ -1,142 +1,191 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
-from bisect import bisect_right
-import time
-from collections import defaultdict
+from sklearn.metrics.pairwise import cosine_similarity
 
-def preprocess_catalog_ultra_fast(catalogo_df: pd.DataFrame) -> Dict:
-    """Extremely fast catalog preprocessing with memory mapping."""
-    if catalogo_df.empty:
-        return {}
-    
-    # Sort by timestamp for binary search
-    catalogo_sorted = catalogo_df.sort_values('timestamp').reset_index(drop=True)
-    
-    # Precompute arrays for fastest possible access
-    timestamps = catalogo_sorted['timestamp'].values
-    itemids = catalogo_sorted['itemid'].values
-    
-    # Precompute contexts as numpy arrays
-    if hasattr(catalogo_sorted['context'].iloc[0], 'shape'):
-        contexts = catalogo_sorted['context'].values
-    else:
-        contexts = np.array([np.array(ctx, dtype=np.float32) for ctx in catalogo_sorted['context'].values])
-    
-    return {
-        'timestamps': timestamps,
-        'itemids': itemids,
-        'contexts': contexts,
-        'size': len(catalogo_sorted)
-    }
-
-def filter_catalog_ultra_fast(preprocessed_catalog: Dict, max_timestamp: float) -> Dict[int, np.ndarray]:
-    """Ultra-fast catalog filtering with binary search and efficient dict creation."""
-    timestamps = preprocessed_catalog['timestamps']
-    
-    if len(timestamps) == 0:
-        return {}
-    
-    # Binary search for the cutoff index
-    idx = bisect_right(timestamps, max_timestamp)
-    if idx == 0:
-        return {}
-    
-    # Create dictionary with direct array slicing (fastest method)
-    itemids = preprocessed_catalog['itemids']
-    contexts = preprocessed_catalog['contexts']
-    
-    # Use dictionary comprehension with pre-allocated arrays
-    return {itemids[i]: contexts[i] for i in range(idx)}
-
-def simular_recomendacao_top5_epsilon_greedy_unlimited(
-    df_merged: pd.DataFrame, catalogo_df: pd.DataFrame, model, top_k: int = 5, warmup: int = 30
+# ----------------------------
+# Função de simulação vetorizada por usuário (torch)
+# ----------------------------
+def simular_recomendacao_top_k_epsilon_greedy_torch(
+    context_events: pd.DataFrame,
+    catalog_df: pd.DataFrame,
+    model: EpsilonGreedyTorch,
+    itemid_to_index: Dict[int,int],
+    top_k: int = 5,
+    warmup: int = 30,
+    use_tqdm: bool = False
 ) -> pd.DataFrame:
-    """Fully optimized recommender without event or candidate limitations."""
-    historico = []
-    reward_map = {'view': 0.1, 'addtocart': 0.5, 'transaction': 1.0}
-    
-    # Preprocess catalog once (major performance gain)
-    preprocessed_catalog = preprocess_catalog_ultra_fast(catalogo_df)
-    
-    # Convert DataFrame to numpy arrays for ultra-fast access
-    n_events = len(df_merged)
-    timestamps = df_merged['timestamp'].values
-    itemids = df_merged['itemid'].values
-    events = df_merged['event'].values
-    
-    # Precompute contexts as numpy arrays
-    if hasattr(df_merged['context'].iloc[0], 'shape'):
-        contexts = df_merged['context'].values
-    else:
-        contexts = np.array([np.array(ctx, dtype=np.float32) for ctx in df_merged['context'].values])
-    
-    # Batch processing variables
-    batch_updates = []
-    BATCH_SIZE = 500  # Optimal batch size for performance
-    
-    # Precompute event rewards
-    event_rewards = np.zeros(n_events, dtype=np.float32)
-    for i in range(n_events):
-        event_rewards[i] = reward_map.get(events[i], 0.0)
-    
-    print(f"Processing {n_events} events with unlimited candidates...")
-    
-    for i in range(n_events):
-        if i % 1000 == 0 and i > 0:
-            print(f"  Processed {i}/{n_events} events")
-            
-        evento_ts = timestamps[i]
-        true_item = itemids[i]
-        contexto_evento = contexts[i]
-        reward_val = event_rewards[i]
+    """
+    context_events: DataFrame com colunas ['timestamp', 'itemid', 'context', 'event']
+        - 'context' é array-like (lista/np.array) com n_features
+    catalog_df: DataFrame com colunas ['itemid', 'timestamp', 'context'] (catalogo disponível ao longo do tempo)
+    model: EpsilonGreedyTorch instanciado com n_items = len(itemid_to_index)
+    itemid_to_index: dict map itemid->index global
+    """
+    history = []
 
-        # Ultra-fast catalog filtering
-        candidatos_context = filter_catalog_ultra_fast(preprocessed_catalog, evento_ts)
-        if not candidatos_context:
+    # Precompute: convert contexts in catalog to tensor matrix for fast slicing
+    # Assumimos que catalog_df contém o catálogo completo usado (itemid pode repetir com timestamps)
+    # Para cada evento filtramos catalog até timestamp do evento -> exemplos abaixo usam filtragem por timestamp
+    # Para performance, transformaremos catalog_df em arrays numpy/tensor para iterações rápidas
+
+    # Convert catalog to arrays
+    catalog_df = catalog_df.copy()
+    catalog_df['item_index'] = catalog_df['itemid'].map(itemid_to_index)
+    catalog_df = catalog_df.dropna(subset=['item_index'])
+    catalog_df['item_index'] = catalog_df['item_index'].astype(int)
+
+    # Convert contexts in catalog to tensor once (we'll index rows)
+    # We'll store contexts in a list aligned with catalog_df rows
+    catalog_contexts = np.stack(catalog_df['context'].to_list()).astype(np.float32)  # [N_catalog_rows, n_features]
+    catalog_timestamps = catalog_df['timestamp'].to_numpy()
+    catalog_item_indices = catalog_df['item_index'].to_numpy(dtype=np.int64)
+
+    # Preconvert context_events to list or arrays
+    context_events = context_events.sort_values(by='timestamp').reset_index(drop=True)
+    contexts_events_arr = np.stack(context_events['context'].to_list()).astype(np.float32)
+    events_timestamps = context_events['timestamp'].to_numpy()
+    events_itemids = context_events['itemid'].to_numpy()
+    events_types = context_events['event'].to_numpy()
+
+    rng = range(len(events_timestamps))
+    if use_tqdm:
+        rng = tqdm(rng, desc="Simulando eventos")
+
+    for i in rng:
+        ts = events_timestamps[i]
+        true_item = int(events_itemids[i])
+        contexto_event = contexts_events_arr[i]
+        tipo_event = events_types[i]
+        reward_val = {'view': 0.1, 'addtocart': 0.5, 'transaction': 1.0}.get(tipo_event, 0.0)
+
+        # Warmup: só update com true_item quando disponível
+        if i < warmup:
+            if true_item in itemid_to_index:
+                idx = itemid_to_index[true_item]
+                model.update_batch(
+                    item_indices=torch.tensor([idx], dtype=torch.long, device=model.device),
+                    contexts=torch.tensor([contexto_event], dtype=torch.float32, device=model.device),
+                    rewards=torch.tensor([reward_val], dtype=torch.float32, device=model.device)
+                )
             continue
+
+        # Filtra catálogo disponível até o timestamp do evento
+        mask = catalog_timestamps <= ts
+        if not mask.any():
+            continue
+
+        # Pegamos os candidatos disponíveis (por linha do catalog)
+        cand_item_indices = catalog_item_indices[mask]         # shape [m]
+        cand_contexts_rows = catalog_contexts[mask]           # shape [m, n_features]
+
+        # Agrupar por item: pode haver múltiplas linhas com mesmo item_index, podemos deduplicar pegando a última ocorrência
+        # Para eficiência: vamos dedup por item mantendo a última ocorrência (maior timestamp)
+        # Construir dict item_index -> position (última)
+        # Essa dedup típica em numpy:
+        uniq_items, last_pos = np.unique(cand_item_indices[::-1], return_index=True)
+        last_pos = (len(cand_item_indices)-1) - last_pos  # converte posição reversa para posição original
+        sel_positions = last_pos[np.argsort(uniq_items)]  # ordena por item index para estabilidade
+        candidate_indices_unique = cand_item_indices[sel_positions]  # item indices únicos
+        candidate_contexts_unique = cand_contexts_rows[sel_positions]  # contexts correspondentes
+
+        # Convert to torch tensors
+        candidate_item_indices_tensor = torch.tensor(candidate_indices_unique, dtype=torch.long, device=model.device)
+        candidate_contexts_tensor = torch.tensor(candidate_contexts_unique, dtype=torch.float32, device=model.device)
+
+        # Seleciona top_k usando operação vetorizada do modelo
+        topk_global_indices = model.select_top_k(candidate_item_indices_tensor, candidate_contexts_tensor, top_k=top_k)
+
+        # Avalia recompensa: se true_item está entre topk
+        recompensa = reward_val if true_item in topk_global_indices else 0.0
+
+        # Atualiza modelo: para cada item do top_k, reward = reward_val se for o true_item else 0
+        # Montamos batch de updates
+        update_item_indices = []
+        update_contexts = []
+        update_rewards = []
+        for itm in topk_global_indices:
+            update_item_indices.append(itm)
+            # acha posição do itm na candidate list para pegar contexto: candidate_item_indices_unique -> find
+            # mais simples: use mapping de item->posição: (we have candidate_item_indices_unique array) -> find index
+            pos = np.where(candidate_indices_unique == itm)[0][0]
+            update_contexts.append(candidate_contexts_unique[pos])
+            update_rewards.append(reward_val if itm == true_item else 0.0)
+
+        # Extra: também atualiza o true_item com supervisão adicional se estiver no catálogo
+        if true_item in itemid_to_index:
+            true_idx = itemid_to_index[true_item]
+            update_item_indices.append(true_idx)
+            update_contexts.append(contexto_event)  # usar contexto do evento (ou do catálogo)
+            update_rewards.append(reward_val)
+
+        # Vetorizando update
+        if len(update_item_indices) > 0:
+            model.update_batch(
+                item_indices=torch.tensor(update_item_indices, dtype=torch.long, device=model.device),
+                contexts=torch.tensor(np.stack(update_contexts).astype(np.float32), dtype=torch.float32, device=model.device),
+                rewards=torch.tensor(update_rewards, dtype=torch.float32, device=model.device)
+            )
+
+        history.append({
+            'timestamp': ts,
+            'true_item': true_item,
+            'top_k': [int(x) for x in topk_global_indices],
+            'reward': float(recompensa)
+        })
+
+    return pd.DataFrame(history)
+
+def simular_recomendacao_top5_epsilon_greedy(df_merged, catalogo_df, model, top_k=5, warmup=30):
+    historico = []
+
+    # Converte contextos para np.array
+    df_merged['context'] = df_merged['context'].apply(lambda x: np.array(x))
+    catalogo_df['context'] = catalogo_df['context'].apply(lambda x: np.array(x))
+
+    for i, row in enumerate(df_merged.itertuples(index=False)):
+        evento_ts = row.timestamp
+        true_item = row.itemid
+        contexto_evento = row.context
+        tipo_evento = row.event
+
+        reward_val = {'view': 0.1, 'addtocart': 0.5, 'transaction': 1.0}.get(tipo_evento, 0.0)
+
+        # Filtra catálogo disponível até o timestamp do evento
+        disponiveis = catalogo_df[catalogo_df['timestamp'] <= evento_ts]
+        if disponiveis.empty:
+            continue
+
+        # Mapeia itemid -> contexto
+        candidatos_context = {
+            r['itemid']: np.array(r['context']) for _, r in disponiveis.iterrows()
+        }
 
         if i < warmup:
-            # Supervised learning
+            # Fase de aprendizado supervisionado
             if true_item in candidatos_context:
-                batch_updates.append((true_item, contexto_evento, reward_val))
-            continue
+                model.update(true_item, contexto_evento, reward_val)
+            continue  # Não recomenda nessa fase
 
-        # Select top k items using optimized batch method
-        if hasattr(model, 'select_top_k'):
-            top_k_items = model.select_top_k(candidatos_context, top_k)
-        else:
-            # For extremely large candidate sets, use efficient iterative selection
-            top_k_items = []
-            candidate_keys = list(candidatos_context.keys())
-            
-            if len(candidate_keys) > 10000:
-                # For massive candidate sets, use batch prediction to find top k
-                scores = model.predict_batch(candidate_keys, 
-                                           [candidatos_context[k] for k in candidate_keys])
-                top_indices = np.argpartition(scores, -top_k)[-top_k:]
-                top_k_items = [candidate_keys[idx] for idx in top_indices]
-            else:
-                # For reasonable candidate sets, use iterative selection
-                temp_candidates = candidatos_context.copy()
-                for _ in range(min(top_k, len(temp_candidates))):
-                    chosen = model.select_item(temp_candidates)
-                    top_k_items.append(chosen)
-                    del temp_candidates[chosen]
+        # Copia dos candidatos para iteração segura
+        candidatos_restantes = candidatos_context.copy()
+        top_k_items = []
 
-        # Calculate reward
-        true_in_topk = true_item in top_k_items
-        recompensa = reward_val if true_in_topk else 0.0
-        
-        # Batch updates for recommended items
+        # Seleção de itens com exploração e exploração
+        for _ in range(min(top_k, len(candidatos_restantes))):
+            # Usa a função select_item diretamente
+            item_escolhido = model.select_item(candidatos_restantes)
+            top_k_items.append(item_escolhido)
+            candidatos_restantes.pop(item_escolhido)
+
+        # Avalia recompensa total: se true_item está entre os top_k
+        recompensa = reward_val if true_item in top_k_items else 0.0
+        # Atualiza modelo com todos os top_k itens
         for item_id in top_k_items:
-            context = candidatos_context[item_id]
             r = reward_val if item_id == true_item else 0.0
-            batch_updates.append((item_id, context, r))
-        
-        # Additional update for true item if not recommended
-        if true_item in candidatos_context and not true_in_topk:
-            batch_updates.append((true_item, candidatos_context[true_item], reward_val))
+            model.update(item_id, candidatos_context[item_id], r)
+        # Aprendizado supervisionado adicional com true_item (se disponível)
+        if true_item in candidatos_context:
+            model.update(true_item, candidatos_context[true_item], reward_val)
 
         historico.append({
             'timestamp': evento_ts,
@@ -144,25 +193,9 @@ def simular_recomendacao_top5_epsilon_greedy_unlimited(
             'top_k': top_k_items,
             'reward': recompensa
         })
-        
-        # Process batch updates to prevent memory overflow
-        if len(batch_updates) >= BATCH_SIZE:
-            if hasattr(model, 'update_batch'):
-                model.update_batch(batch_updates)
-            else:
-                for update in batch_updates:
-                    model.update(*update)
-            batch_updates = []
-    
-    # Process any remaining updates
-    if batch_updates:
-        if hasattr(model, 'update_batch'):
-            model.update_batch(batch_updates)
-        else:
-            for update in batch_updates:
-                model.update(*update)
 
     return pd.DataFrame(historico)
+
 
 def simular_recomendacao_coseno(df_merged, catalogo_df):
     historico = []
