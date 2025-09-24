@@ -317,3 +317,5 @@ def simular_recomendacao_top1_epsilongreedy(df_merged, catalogo_df, model):
 
     return pd.DataFrame(historico)
 
+if __name__ == "__main__":
+    print("Recommenders carregado corretamente")

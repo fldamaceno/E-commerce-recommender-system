@@ -80,3 +80,6 @@ class DataProcessor:
             print(f"❌ Erro processando usuário {user_id}: {e}")
             return None
 
+# Adicione esta linha no FINAL do arquivo
+if __name__ == "__main__":
+    print("Data_Processor carregado corretamente")

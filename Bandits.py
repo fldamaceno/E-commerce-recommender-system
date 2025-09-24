@@ -85,3 +85,6 @@ class CorrectedEpsilonGreedy:
         prediction = np.dot(weights, context_normalized)
         error = reward - prediction
         self.weights[item_id] = weights + self.lr * error * context_normalized
+
+if __name__ == "__main__":
+    print("Bandits carregado corretamente")
