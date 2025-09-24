@@ -1,0 +1,83 @@
+
+import torch
+import numpy as np
+import pandas as pd
+from typing import List, Dict
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+class DataProcessor:
+    def __init__(self, events, prop_test, rec_items_test):
+        """Processador otimizado mas que mantém a estrutura dos dados originais"""
+        self.events = events.copy()
+        self.prop_test = prop_test.copy()
+        self.rec_items_test = rec_items_test.copy()
+        self._optimized_setup()
+    
+    def _optimized_setup(self):
+        """Configuração otimizada mas compatível"""
+        # Conversão rápida de timestamps
+        for df in [self.events, self.prop_test, self.rec_items_test]:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        # Ordenação para performance
+        self.prop_test = self.prop_test.sort_values('timestamp')
+        self.rec_items_test = self.rec_items_test.sort_values('timestamp')
+    
+    def process_user(self, user_id):
+        """Processamento otimizado mas com mesma lógica original"""
+        try:
+            # Filtra eventos do usuário
+            user_events = self.events[self.events['visitorid'] == user_id].copy()
+            if user_events.empty:
+                return None
+            
+            # Merge eficiente
+            merged = user_events.merge(self.prop_test, on='itemid', how='left', suffixes=('_event', '_prop'))
+            if merged.empty:
+                return None
+            
+            # Filtro temporal otimizado
+            valid_mask = merged['timestamp_prop'] <= merged['timestamp_event']
+            validos = merged[valid_mask].copy()
+            if validos.empty:
+                return None
+            
+            # Encontra propriedade mais recente (lógica original)
+            validos['time_diff'] = (validos['timestamp_event'] - validos['timestamp_prop']).dt.total_seconds()
+            idx_min = validos.groupby(['itemid', 'timestamp_event'])['time_diff'].idxmin()
+            resultado = validos.loc[idx_min].copy()
+            
+            # Prepara contextos (mantém formato original)
+            resultado['context'] = resultado['context'].apply(
+                lambda x: np.array(x, dtype=np.float32) if isinstance(x, (list, np.ndarray)) 
+                else np.zeros(6, dtype=np.float32)
+            )
+            
+            # Prepara dados finais
+            context_events = resultado[['timestamp_event', 'itemid', 'context', 'event']].rename(
+                columns={'timestamp_event': 'timestamp'}
+            )
+            
+            # Filtra rec_items_test
+            max_ts = context_events['timestamp'].max()
+            user_rec_items = self.rec_items_test[self.rec_items_test['timestamp'] <= max_ts].copy()
+            
+            # Garante contextos no rec_items
+            user_rec_items['context'] = user_rec_items['context'].apply(
+                lambda x: np.array(x, dtype=np.float32) if isinstance(x, (list, np.ndarray)) 
+                else np.zeros(6, dtype=np.float32)
+            )
+            
+            return {
+                'context_events': context_events,
+                'rec_items': user_rec_items,
+                'n_features': 6,
+                'user_id': user_id
+            }
+            
+        except Exception as e:
+            print(f"❌ Erro processando usuário {user_id}: {e}")
+            return None
+
