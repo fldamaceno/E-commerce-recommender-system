@@ -45,12 +45,13 @@ class EpsilonGreedy:
 
 
 class CorrectedEpsilonGreedy:
-    def __init__(self, epsilon: float, n_features: int, learning_rate: float = 0.1):
+    def __init__(self, epsilon: float, n_features: int, normalize_weights: bool, learning_rate: float = 0.1):
         """Mantém a lógica ORIGINAL do seu código que funcionava"""
         self.epsilon = epsilon
         self.lr = learning_rate
         self.n_features = n_features
         self.weights = {}  # item_id -> vetor de pesos (MESMO do original)
+        self.normalize_weights = normalize_weights
     
     def _get_weights(self, item_id):
         """MESMA lógica do original"""
@@ -85,6 +86,10 @@ class CorrectedEpsilonGreedy:
         prediction = np.dot(weights, context_normalized)
         error = reward - prediction
         self.weights[item_id] = weights + self.lr * error * context_normalized
+
+        # Normaliza os pesos apenas se a opção estiver ativada
+        if self.normalize_weights:
+            self.weights[item_id] = self._normalize(self.weights[item_id])
 
 if __name__ == "__main__":
     print("Bandits carregado corretamente")

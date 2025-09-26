@@ -98,7 +98,7 @@ def simular_recomendacao_corrigida(df_merged, catalogo_df, model, top_k=5, warmu
                 model.update(item_id, candidatos_context[item_id], r)
             
             # Aprendizado supervisionado adicional (original)
-            if true_item in candidatos_context:
+            if true_item not in top_k_items and true_item in candidatos_context:
                 model.update(true_item, candidatos_context[true_item], reward_val)
             
             historico.append({
